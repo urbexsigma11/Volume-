@@ -1,0 +1,55 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rozpakuj projekt.txt do plików
+        run: |
+          python3 - <<'EOF'
+          import re, os
+          text = open('projekt.txt', encoding='utf-8').read()
+          parts = re.split(r'^=====FILE: (.+?)=====\n', text, flags=re.M)
+          for i in range(1, len(parts), 2):
+              path = parts[i].strip()
+              content = parts[i + 1]
+              folder = os.path.dirname(path)
+              if folder:
+                  os.makedirs(folder, exist_ok=True)
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(content)
+              print('OK', path)
+          EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Zbuduj APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AppVolume-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Opublikuj APK w Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: AppVolume ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
