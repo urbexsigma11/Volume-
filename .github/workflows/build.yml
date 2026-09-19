@@ -17,7 +17,8 @@ jobs:
         run: |
           python3 - <<'EOF'
           import re, os
-          text = open('projekt.txt', encoding='utf-8').read()
+          name = [f for f in os.listdir('.') if f.lower().startswith('projekt')][0]
+          text = open(name, encoding='utf-8').read()
           parts = re.split(r'^=====FILE: (.+?)=====\n', text, flags=re.M)
           for i in range(1, len(parts), 2):
               path = parts[i].strip()
