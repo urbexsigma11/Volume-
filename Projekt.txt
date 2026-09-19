@@ -1,0 +1,504 @@
+=====FILE: settings.gradle.kts=====
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "AppVolume"
+include(":app")
+=====FILE: build.gradle.kts=====
+plugins {
+    id("com.android.application") version "8.7.3" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+}
+=====FILE: gradle.properties=====
+org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+kotlin.code.style=official
+=====FILE: app/build.gradle.kts=====
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "pl.appvolume"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "pl.appvolume"
+        minSdk = 30
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation("org.lsposed.hiddenapibypass:hiddenapibypass:4.3")
+}
+=====FILE: app/src/main/AndroidManifest.xml=====
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <application
+        android:name=".App"
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.DeviceDefault">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".VolumeService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_config" />
+        </service>
+
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+    </application>
+</manifest>
+=====FILE: app/src/main/res/values/strings.xml=====
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Głośność aplikacji</string>
+    <string name="service_desc">Pokazuje boczny panel z głośnością poszczególnych aplikacji po naciśnięciu przycisków głośności.</string>
+</resources>
+=====FILE: app/src/main/res/xml/accessibility_config.xml=====
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRequestFilterKeyEvents"
+    android:canRequestFilterKeyEvents="true"
+    android:description="@string/service_desc"
+    android:notificationTimeout="200" />
+=====FILE: app/src/main/java/pl/appvolume/App.kt=====
+package pl.appvolume
+
+import android.app.Application
+import android.os.Build
+import org.lsposed.hiddenapibypass.HiddenApiBypass
+
+class App : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        if (Build.VERSION.SDK_INT >= 28) {
+            try {
+                HiddenApiBypass.addHiddenApiExemptions("L")
+            } catch (_: Throwable) {
+            }
+        }
+    }
+}
+=====FILE: app/src/main/java/pl/appvolume/AudioEngine.kt=====
+package pl.appvolume
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.os.IBinder
+import android.os.Process
+import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuBinderWrapper
+import rikka.shizuku.SystemServiceHelper
+import java.util.concurrent.ConcurrentHashMap
+
+class AppPlayers(val pkg: String, val label: String, val proxies: List<Any>)
+
+/**
+ * Regulacja głośności per aplikacja.
+ * Przez Shizuku (uprawnienia "shell") pobieramy listę aktywnych odtwarzaczy z AudioService
+ * i wywołujemy setVolume() na PlayerProxy każdego z nich.
+ */
+object AudioEngine {
+    private var prefs: SharedPreferences? = null
+    private val volumes = ConcurrentHashMap<String, Float>()
+
+    fun init(ctx: Context) {
+        if (prefs != null) return
+        val p = ctx.applicationContext.getSharedPreferences("volumes", Context.MODE_PRIVATE)
+        prefs = p
+        for ((k, v) in p.all) {
+            if (v is Float) volumes[k] = v
+        }
+    }
+
+    fun volumeOf(pkg: String): Float = volumes[pkg] ?: 1f
+
+    fun shizukuReady(): Boolean = try {
+        Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+    } catch (t: Throwable) {
+        false
+    }
+
+    private fun audioService(): Any {
+        val binder: IBinder = ShizukuBinderWrapper(SystemServiceHelper.getSystemService("audio"))
+        val stub = Class.forName("android.media.IAudioService\$Stub")
+        return stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder)!!
+    }
+
+    fun activePlayers(pm: PackageManager): List<AppPlayers> {
+        val svc = audioService()
+        val method = Class.forName("android.media.IAudioService")
+            .getMethod("getActivePlaybackConfigurations")
+        val list = method.invoke(svc) as? List<*> ?: return emptyList()
+
+        val grouped = LinkedHashMap<String, MutableList<Any>>()
+        for (cfg in list) {
+            if (cfg == null) continue
+            val uid = cfg.javaClass.getMethod("getClientUid").invoke(cfg) as Int
+            if (uid < 0 || uid == Process.myUid()) continue
+            val proxy = cfg.javaClass.getMethod("getPlayerProxy").invoke(cfg) ?: continue
+            val pkg = pm.getPackagesForUid(uid)?.firstOrNull() ?: continue
+            grouped.getOrPut(pkg) { mutableListOf() }.add(proxy)
+        }
+        return grouped.map { (pkg, proxies) -> AppPlayers(pkg, labelOf(pm, pkg), proxies) }
+    }
+
+    private fun labelOf(pm: PackageManager, pkg: String): String = try {
+        pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+    } catch (e: Exception) {
+        pkg
+    }
+
+    private fun applyTo(p: AppPlayers) {
+        val v = volumes[p.pkg] ?: return
+        for (proxy in p.proxies) {
+            try {
+                proxy.javaClass.getMethod("setVolume", java.lang.Float.TYPE).invoke(proxy, v)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun setVolume(pm: PackageManager, pkg: String, value: Float) {
+        volumes[pkg] = value
+        prefs?.edit()?.putFloat(pkg, value)?.apply()
+        enforce(pm)
+    }
+
+    /** Ponownie ustawia zapamiętane głośności (aplikacje potrafią je resetować, np. przy zmianie fokusu audio). */
+    fun enforce(pm: PackageManager) {
+        if (volumes.isEmpty() || !shizukuReady()) return
+        try {
+            activePlayers(pm).forEach { applyTo(it) }
+        } catch (_: Throwable) {
+        }
+    }
+}
+=====FILE: app/src/main/java/pl/appvolume/VolumeService.kt=====
+package pl.appvolume
+
+import android.accessibilityservice.AccessibilityService
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.KeyEvent
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.widget.LinearLayout
+import android.widget.SeekBar
+import android.widget.TextView
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
+
+class VolumeService : AccessibilityService() {
+
+    private val ui = Handler(Looper.getMainLooper())
+    private val bg: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    private lateinit var wm: WindowManager
+    private var panel: LinearLayout? = null
+    private val hideTask = Runnable { removePanel() }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        AudioEngine.init(this)
+        bg.scheduleWithFixedDelay({ AudioEngine.enforce(packageManager) }, 2, 2, TimeUnit.SECONDS)
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+    override fun onInterrupt() {}
+
+    override fun onKeyEvent(event: KeyEvent): Boolean {
+        val isVolume = event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+            event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+        if (isVolume && event.action == KeyEvent.ACTION_DOWN) {
+            if (event.repeatCount == 0 || panel == null) {
+                showPanel()
+            } else {
+                scheduleHide()
+            }
+        }
+        // false = system dalej normalnie zmienia głośność
+        return false
+    }
+
+    override fun onDestroy() {
+        removePanel()
+        bg.shutdownNow()
+        super.onDestroy()
+    }
+
+    private fun showPanel() {
+        bg.execute {
+            val players: List<AppPlayers>? = try {
+                if (AudioEngine.shizukuReady()) AudioEngine.activePlayers(packageManager) else null
+            } catch (t: Throwable) {
+                null
+            }
+            ui.post { buildPanel(players) }
+        }
+    }
+
+    private fun buildPanel(players: List<AppPlayers>?) {
+        removePanel()
+        val svc = this@VolumeService
+
+        val root = LinearLayout(svc)
+        root.orientation = LinearLayout.VERTICAL
+        root.setPadding(dp(14), dp(12), dp(14), dp(12))
+        val bgShape = GradientDrawable()
+        bgShape.cornerRadius = dp(20).toFloat()
+        bgShape.setColor(0xEE202124.toInt())
+        root.background = bgShape
+
+        fun label(t: String): TextView {
+            val tv = TextView(svc)
+            tv.text = t
+            tv.setTextColor(Color.WHITE)
+            tv.textSize = 13f
+            return tv
+        }
+
+        if (players == null) {
+            root.addView(label("Brak połączenia z Shizuku.\nOtwórz aplikację „Głośność aplikacji”."))
+        } else if (players.isEmpty()) {
+            root.addView(label("Żadna aplikacja nic teraz nie odtwarza."))
+        } else {
+            for (p in players) {
+                root.addView(label(p.label))
+                val sb = SeekBar(svc)
+                sb.max = 100
+                sb.progress = (AudioEngine.volumeOf(p.pkg) * 100).toInt()
+                sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(s: SeekBar?, v: Int, fromUser: Boolean) {
+                        if (fromUser) {
+                            bg.execute { AudioEngine.setVolume(packageManager, p.pkg, v / 100f) }
+                        }
+                    }
+
+                    override fun onStartTrackingTouch(s: SeekBar?) {
+                        ui.removeCallbacks(hideTask)
+                    }
+
+                    override fun onStopTrackingTouch(s: SeekBar?) {
+                        scheduleHide()
+                    }
+                })
+                root.addView(sb)
+            }
+        }
+
+        val lp = WindowManager.LayoutParams(
+            dp(230),
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        )
+        lp.gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        lp.x = dp(56)
+
+        try {
+            wm.addView(root, lp)
+            panel = root
+            scheduleHide()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun scheduleHide() {
+        ui.removeCallbacks(hideTask)
+        ui.postDelayed(hideTask, 4000)
+    }
+
+    private fun removePanel() {
+        ui.removeCallbacks(hideTask)
+        panel?.let {
+            try {
+                wm.removeView(it)
+            } catch (_: Throwable) {
+            }
+        }
+        panel = null
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+}
+=====FILE: app/src/main/java/pl/appvolume/MainActivity.kt=====
+package pl.appvolume
+
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.provider.Settings
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
+import rikka.shizuku.Shizuku
+
+class MainActivity : Activity() {
+
+    private lateinit var status: TextView
+
+    private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ ->
+        runOnUiThread { refresh() }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val act = this@MainActivity
+        val pad = (16 * resources.displayMetrics.density).toInt()
+
+        val col = LinearLayout(act)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(pad, pad, pad, pad)
+
+        status = TextView(act)
+        status.textSize = 16f
+        col.addView(status)
+
+        fun button(text: String, action: () -> Unit) {
+            val b = Button(act)
+            b.text = text
+            b.setOnClickListener { action() }
+            col.addView(b)
+        }
+
+        button("1. Otwórz Shizuku") {
+            val i = packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+            if (i != null) startActivity(i)
+            else Toast.makeText(act, "Zainstaluj Shizuku ze Sklepu Play", Toast.LENGTH_LONG).show()
+        }
+        button("2. Nadaj uprawnienie Shizuku") {
+            try {
+                Shizuku.requestPermission(1)
+            } catch (t: Throwable) {
+                Toast.makeText(act, "Najpierw uruchom Shizuku", Toast.LENGTH_LONG).show()
+            }
+        }
+        button("3. Zezwól na ustawienia z ograniczeniami") {
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        }
+        button("4. Włącz usługę dostępności") {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+        button("Odśwież status") { refresh() }
+
+        val scroll = ScrollView(act)
+        scroll.addView(col)
+        setContentView(scroll)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        try {
+            Shizuku.addRequestPermissionResultListener(permListener)
+        } catch (_: Throwable) {
+        }
+    }
+
+    override fun onStop() {
+        try {
+            Shizuku.removeRequestPermissionResultListener(permListener)
+        } catch (_: Throwable) {
+        }
+        super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refresh()
+    }
+
+    private fun refresh() {
+        val running = try {
+            Shizuku.pingBinder()
+        } catch (t: Throwable) {
+            false
+        }
+        val perm = AudioEngine.shizukuReady()
+        val enabled = (Settings.Secure.getString(
+            contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: "").contains(packageName)
+
+        status.text = "Shizuku: " + (if (running) "działa" else "nie działa") +
+            "\nUprawnienie Shizuku: " + (if (perm) "tak" else "nie") +
+            "\nUsługa panelu: " + (if (enabled) "włączona" else "wyłączona") + "\n"
+    }
+}
